@@ -231,3 +231,87 @@
 (define-read-only (get-token-count)
   (ok (- (var-get next-token-id) u1))
 )
+
+
+(define-map content-bundles
+  { bundle-id: uint }
+  {
+    name: (string-ascii 100),
+    creator: principal,
+    content-ids: (list 50 uint),
+    access-level: uint,
+    price: uint,
+    is-active: bool
+  }
+)
+
+(define-data-var next-bundle-id uint u1)
+
+(define-public (create-bundle (name (string-ascii 100)) (content-ids (list 50 uint)) (access-level uint) (price uint))
+  (let
+    (
+      (bundle-id (var-get next-bundle-id))
+    )
+    (asserts! (> (len name) u0) err-invalid-params)
+    (asserts! (> (len content-ids) u0) err-invalid-params)
+    
+    (map-set content-bundles
+      { bundle-id: bundle-id }
+      {
+        name: name,
+        creator: tx-sender,
+        content-ids: content-ids,
+        access-level: access-level,
+        price: price,
+        is-active: true
+      }
+    )
+    
+    (var-set next-bundle-id (+ bundle-id u1))
+    (ok bundle-id)
+  )
+)
+
+(define-read-only (get-bundle (bundle-id uint))
+  (ok (unwrap! (map-get? content-bundles { bundle-id: bundle-id }) err-content-not-found))
+)
+
+
+(define-map content-locks
+  { content-id: uint }
+  {
+    release-height: uint,
+    is-locked: bool
+  }
+)
+
+(define-public (set-content-lock (content-id uint) (release-height uint))
+  (let
+    (
+      (content (unwrap! (map-get? contents { content-id: content-id }) err-content-not-found))
+    )
+    (asserts! (is-eq (get creator content) tx-sender) err-unauthorized)
+    (asserts! (>= release-height stacks-block-height) err-invalid-params)
+    
+    (map-set content-locks
+      { content-id: content-id }
+      {
+        release-height: release-height,
+        is-locked: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (is-content-available (content-id uint))
+  (let
+    (
+      (lock-info (unwrap! (map-get? content-locks { content-id: content-id }) (ok true)))
+    )
+    (if (get is-locked lock-info)
+      (ok (>= stacks-block-height (get release-height lock-info)))
+      (ok true)
+    )
+  )
+)
