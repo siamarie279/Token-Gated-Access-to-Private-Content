@@ -315,3 +315,185 @@
     )
   )
 )
+
+
+(define-constant err-invalid-split (err u107))
+(define-constant err-no-revenue (err u108))
+(define-constant err-split-exists (err u109))
+
+;; Revenue sharing structures
+(define-map revenue-splits
+  { content-id: uint }
+  {
+    creator: principal,
+    beneficiaries: (list 10 principal),
+    percentages: (list 10 uint),
+    total-revenue: uint,
+    is-active: bool
+  }
+)
+
+(define-map beneficiary-balances
+  { beneficiary: principal, content-id: uint }
+  { balance: uint }
+)
+
+(define-map total-beneficiary-earnings
+  { beneficiary: principal }
+  { total-earned: uint }
+)
+
+;; Set up revenue sharing for content
+(define-public (setup-revenue-split (content-id uint) (beneficiaries (list 10 principal)) (percentages (list 10 uint)))
+  (let
+    (
+      (content (unwrap! (map-get? contents { content-id: content-id }) err-content-not-found))
+      (total-percentage (fold + percentages u0))
+    )
+    (asserts! (is-eq (get creator content) tx-sender) err-unauthorized)
+    (asserts! (is-eq (len beneficiaries) (len percentages)) err-invalid-params)
+    (asserts! (is-eq total-percentage u100) err-invalid-split)
+    (asserts! (is-none (map-get? revenue-splits { content-id: content-id })) err-split-exists)
+    
+    (map-set revenue-splits
+      { content-id: content-id }
+      {
+        creator: tx-sender,
+        beneficiaries: beneficiaries,
+        percentages: percentages,
+        total-revenue: u0,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Record revenue and distribute to beneficiaries
+(define-public (record-revenue (content-id uint) (amount uint))
+  (let
+    (
+      (content (unwrap! (map-get? contents { content-id: content-id }) err-content-not-found))
+      (split-info (unwrap! (map-get? revenue-splits { content-id: content-id }) err-content-not-found))
+    )
+    (asserts! (is-eq (get creator content) tx-sender) err-unauthorized)
+    (asserts! (> amount u0) err-invalid-params)
+    (asserts! (get is-active split-info) err-content-locked)
+    
+    (distribute-revenue content-id amount (get beneficiaries split-info) (get percentages split-info))
+    
+    (map-set revenue-splits
+      { content-id: content-id }
+      {
+        creator: (get creator split-info),
+        beneficiaries: (get beneficiaries split-info),
+        percentages: (get percentages split-info),
+        total-revenue: (+ (get total-revenue split-info) amount),
+        is-active: (get is-active split-info)
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Helper function to distribute revenue
+(define-private (distribute-revenue (content-id uint) (total-amount uint) (beneficiaries (list 10 principal)) (percentages (list 10 uint)))
+  (begin
+    (fold distribute-to-beneficiary 
+      (zip beneficiaries percentages) 
+      { content-id: content-id, total-amount: total-amount, success: true }
+    )
+  )
+)
+
+;; Helper function to distribute to individual beneficiary
+(define-private (distribute-to-beneficiary (pair { beneficiary: principal, percentage: uint }) (context { content-id: uint, total-amount: uint, success: bool }))
+  (let
+    (
+      (beneficiary (get beneficiary pair))
+      (percentage (get percentage pair))
+      (content-id (get content-id context))
+      (total-amount (get total-amount context))
+      (share-amount (/ (* total-amount percentage) u100))
+      (current-balance (default-to u0 (get balance (map-get? beneficiary-balances { beneficiary: beneficiary, content-id: content-id }))))
+      (current-total (default-to u0 (get total-earned (map-get? total-beneficiary-earnings { beneficiary: beneficiary }))))
+    )
+    (map-set beneficiary-balances
+      { beneficiary: beneficiary, content-id: content-id }
+      { balance: (+ current-balance share-amount) }
+    )
+    (map-set total-beneficiary-earnings
+      { beneficiary: beneficiary }
+      { total-earned: (+ current-total share-amount) }
+    )
+    context
+  )
+)
+
+;; Helper function to zip two lists
+(define-private (zip (list1 (list 10 principal)) (list2 (list 10 uint)))
+  (map create-pair-at-index (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9))
+)
+
+;; Helper function to create pairs
+(define-private (create-pair-at-index (index uint))
+  {
+    beneficiary: (default-to tx-sender (element-at? (list tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender tx-sender) index)),
+    percentage: (default-to u0 (element-at? (list u0 u0 u0 u0 u0 u0 u0 u0 u0 u0) index))
+  }
+)
+
+;; Withdraw earnings for a beneficiary
+(define-public (withdraw-earnings (content-id uint))
+  (let
+    (
+      (balance-info (unwrap! (map-get? beneficiary-balances { beneficiary: tx-sender, content-id: content-id }) err-no-revenue))
+      (balance (get balance balance-info))
+    )
+    (asserts! (> balance u0) err-no-revenue)
+    
+    (map-set beneficiary-balances
+      { beneficiary: tx-sender, content-id: content-id }
+      { balance: u0 }
+    )
+    (ok balance)
+  )
+)
+
+;; Get revenue split information
+(define-read-only (get-revenue-split (content-id uint))
+  (ok (unwrap! (map-get? revenue-splits { content-id: content-id }) err-content-not-found))
+)
+
+;; Get beneficiary balance for specific content
+(define-read-only (get-beneficiary-balance (beneficiary principal) (content-id uint))
+  (ok (default-to u0 (get balance (map-get? beneficiary-balances { beneficiary: beneficiary, content-id: content-id }))))
+)
+
+;; Get total earnings for beneficiary
+(define-read-only (get-total-earnings (beneficiary principal))
+  (ok (default-to u0 (get total-earned (map-get? total-beneficiary-earnings { beneficiary: beneficiary }))))
+)
+
+;; Toggle revenue split status
+(define-public (toggle-revenue-split (content-id uint))
+  (let
+    (
+      (content (unwrap! (map-get? contents { content-id: content-id }) err-content-not-found))
+      (split-info (unwrap! (map-get? revenue-splits { content-id: content-id }) err-content-not-found))
+    )
+    (asserts! (is-eq (get creator content) tx-sender) err-unauthorized)
+    
+    (map-set revenue-splits
+      { content-id: content-id }
+      {
+        creator: (get creator split-info),
+        beneficiaries: (get beneficiaries split-info),
+        percentages: (get percentages split-info),
+        total-revenue: (get total-revenue split-info),
+        is-active: (not (get is-active split-info))
+      }
+    )
+    (ok true)
+  )
+)
