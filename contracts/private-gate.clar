@@ -497,3 +497,216 @@
     (ok true)
   )
 )
+
+(define-constant err-subscription-exists (err u110))
+(define-constant err-subscription-not-found (err u111))
+(define-constant err-subscription-expired (err u112))
+(define-constant err-insufficient-payment (err u113))
+
+(define-map content-subscriptions
+  { subscription-id: uint }
+  {
+    creator: principal,
+    subscriber: principal,
+    content-ids: (list 50 uint),
+    price-per-period: uint,
+    period-length: uint,
+    start-height: uint,
+    end-height: uint,
+    auto-renew: bool,
+    is-active: bool
+  }
+)
+
+(define-map user-subscriptions
+  { user: principal, creator: principal }
+  { 
+    subscription-id: uint,
+    expires-at: uint
+  }
+)
+
+(define-map creator-subscription-plans
+  { creator: principal, plan-id: uint }
+  {
+    name: (string-ascii 50),
+    price-per-period: uint,
+    period-length: uint,
+    content-ids: (list 50 uint),
+    is-active: bool
+  }
+)
+
+(define-data-var next-subscription-id uint u1)
+
+(define-public (create-subscription-plan (plan-id uint) (name (string-ascii 50)) (price-per-period uint) (period-length uint) (content-ids (list 50 uint)))
+  (begin
+    (asserts! (> (len name) u0) err-invalid-params)
+    (asserts! (> price-per-period u0) err-invalid-params)
+    (asserts! (> period-length u0) err-invalid-params)
+    (asserts! (> (len content-ids) u0) err-invalid-params)
+    
+    (map-set creator-subscription-plans
+      { creator: tx-sender, plan-id: plan-id }
+      {
+        name: name,
+        price-per-period: price-per-period,
+        period-length: period-length,
+        content-ids: content-ids,
+        is-active: true
+      }
+    )
+    (ok plan-id)
+  )
+)
+
+(define-public (subscribe-to-creator (creator principal) (plan-id uint) (auto-renew bool))
+  (let
+    (
+      (subscription-id (var-get next-subscription-id))
+      (plan (unwrap! (map-get? creator-subscription-plans { creator: creator, plan-id: plan-id }) err-content-not-found))
+      (existing-sub (map-get? user-subscriptions { user: tx-sender, creator: creator }))
+    )
+    (asserts! (is-none existing-sub) err-subscription-exists)
+    (asserts! (get is-active plan) err-content-locked)
+    
+    (map-set content-subscriptions
+      { subscription-id: subscription-id }
+      {
+        creator: creator,
+        subscriber: tx-sender,
+        content-ids: (get content-ids plan),
+        price-per-period: (get price-per-period plan),
+        period-length: (get period-length plan),
+        start-height: stacks-block-height,
+        end-height: (+ stacks-block-height (get period-length plan)),
+        auto-renew: auto-renew,
+        is-active: true
+      }
+    )
+    
+    (map-set user-subscriptions
+      { user: tx-sender, creator: creator }
+      {
+        subscription-id: subscription-id,
+        expires-at: (+ stacks-block-height (get period-length plan))
+      }
+    )
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (renew-subscription (creator principal))
+  (let
+    (
+      (user-sub (unwrap! (map-get? user-subscriptions { user: tx-sender, creator: creator }) err-subscription-not-found))
+      (subscription-id (get subscription-id user-sub))
+      (subscription (unwrap! (map-get? content-subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+    )
+    (asserts! (get is-active subscription) err-content-locked)
+    (asserts! (get auto-renew subscription) err-unauthorized)
+    
+    (map-set content-subscriptions
+      { subscription-id: subscription-id }
+      {
+        creator: (get creator subscription),
+        subscriber: (get subscriber subscription),
+        content-ids: (get content-ids subscription),
+        price-per-period: (get price-per-period subscription),
+        period-length: (get period-length subscription),
+        start-height: (get start-height subscription),
+        end-height: (+ (get end-height subscription) (get period-length subscription)),
+        auto-renew: (get auto-renew subscription),
+        is-active: (get is-active subscription)
+      }
+    )
+    
+    (map-set user-subscriptions
+      { user: tx-sender, creator: creator }
+      {
+        subscription-id: subscription-id,
+        expires-at: (+ (get expires-at user-sub) (get period-length subscription))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (creator principal))
+  (let
+    (
+      (user-sub (unwrap! (map-get? user-subscriptions { user: tx-sender, creator: creator }) err-subscription-not-found))
+      (subscription-id (get subscription-id user-sub))
+      (subscription (unwrap! (map-get? content-subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+    )
+    (asserts! (is-eq (get subscriber subscription) tx-sender) err-unauthorized)
+    
+    (map-set content-subscriptions
+      { subscription-id: subscription-id }
+      {
+        creator: (get creator subscription),
+        subscriber: (get subscriber subscription),
+        content-ids: (get content-ids subscription),
+        price-per-period: (get price-per-period subscription),
+        period-length: (get period-length subscription),
+        start-height: (get start-height subscription),
+        end-height: (get end-height subscription),
+        auto-renew: false,
+        is-active: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (check-subscription-access (user principal) (creator principal) (content-id uint))
+  (let
+    (
+      (user-sub (map-get? user-subscriptions { user: user, creator: creator }))
+      (subscription-id (default-to u0 (get subscription-id user-sub)))
+      (subscription (map-get? content-subscriptions { subscription-id: subscription-id }))
+    )
+    (if (and 
+          (is-some user-sub)
+          (is-some subscription)
+          (get is-active (unwrap-panic subscription))
+          (> (get expires-at (unwrap-panic user-sub)) stacks-block-height)
+          (is-some (index-of (get content-ids (unwrap-panic subscription)) content-id)))
+      (ok true)
+      (ok false)
+    )
+  )
+)
+
+(define-read-only (get-subscription-plan (creator principal) (plan-id uint))
+  (ok (unwrap! (map-get? creator-subscription-plans { creator: creator, plan-id: plan-id }) err-content-not-found))
+)
+
+(define-read-only (get-user-subscription (user principal) (creator principal))
+  (ok (unwrap! (map-get? user-subscriptions { user: user, creator: creator }) err-subscription-not-found))
+)
+
+(define-read-only (get-subscription-details (subscription-id uint))
+  (ok (unwrap! (map-get? content-subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+)
+
+(define-public (toggle-subscription-plan (plan-id uint))
+  (let
+    (
+      (plan (unwrap! (map-get? creator-subscription-plans { creator: tx-sender, plan-id: plan-id }) err-content-not-found))
+    )
+    (map-set creator-subscription-plans
+      { creator: tx-sender, plan-id: plan-id }
+      {
+        name: (get name plan),
+        price-per-period: (get price-per-period plan),
+        period-length: (get period-length plan),
+        content-ids: (get content-ids plan),
+        is-active: (not (get is-active plan))
+      }
+    )
+    (ok true)
+  )
+)
