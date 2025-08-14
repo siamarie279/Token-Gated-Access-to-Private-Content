@@ -710,3 +710,293 @@
     (ok true)
   )
 )
+
+;; Content Analytics and Engagement Tracking System
+(define-constant err-analytics-not-found (err u114))
+(define-constant err-invalid-engagement (err u115))
+
+;; Content analytics data
+(define-map content-analytics
+  { content-id: uint }
+  {
+    total-views: uint,
+    unique-viewers: uint,
+    engagement-score: uint,
+    last-viewed: uint,
+    creator: principal
+  }
+)
+
+;; User engagement tracking
+(define-map user-content-engagement
+  { user: principal, content-id: uint }
+  {
+    view-count: uint,
+    first-viewed: uint,
+    last-viewed: uint,
+    engagement-score: uint
+  }
+)
+
+;; Daily analytics aggregation
+(define-map daily-analytics
+  { content-id: uint, day: uint }
+  {
+    views: uint,
+    unique-users: uint,
+    total-engagement: uint
+  }
+)
+
+;; Creator performance metrics
+(define-map creator-analytics
+  { creator: principal }
+  {
+    total-content: uint,
+    total-views: uint,
+    avg-engagement: uint,
+    top-content-id: uint,
+    last-updated: uint
+  }
+)
+
+;; Popular content tracking
+(define-map popular-content-rankings
+  { rank: uint }
+  {
+    content-id: uint,
+    engagement-score: uint,
+    view-count: uint,
+    last-updated: uint
+  }
+)
+
+;; User behavior patterns
+(define-map user-behavior-analytics
+  { user: principal }
+  {
+    total-content-viewed: uint,
+    avg-engagement: uint,
+    preferred-access-level: uint,
+    most-viewed-creator: principal,
+    last-activity: uint
+  }
+)
+
+;; Track content view and update analytics
+(define-public (track-content-view (content-id uint) (engagement-rating uint))
+  (let
+    (
+      (content (unwrap! (map-get? contents { content-id: content-id }) err-content-not-found))
+      (current-analytics (map-get? content-analytics { content-id: content-id }))
+      (user-engagement (map-get? user-content-engagement { user: tx-sender, content-id: content-id }))
+      (current-day (/ stacks-block-height u144)) ;; Approximate daily blocks
+    )
+    (asserts! (get is-active content) err-content-locked)
+    (asserts! (<= engagement-rating u10) err-invalid-engagement)
+    
+    ;; Update content analytics
+    (map-set content-analytics
+      { content-id: content-id }
+      {
+        total-views: (+ (default-to u0 (get total-views current-analytics)) u1),
+        unique-viewers: (if (is-none user-engagement) 
+                         (+ (default-to u0 (get unique-viewers current-analytics)) u1)
+                         (default-to u0 (get unique-viewers current-analytics))),
+        engagement-score: (+ (default-to u0 (get engagement-score current-analytics)) engagement-rating),
+        last-viewed: stacks-block-height,
+        creator: (get creator content)
+      }
+    )
+    
+    ;; Update user engagement
+    (map-set user-content-engagement
+      { user: tx-sender, content-id: content-id }
+      {
+        view-count: (+ (default-to u0 (get view-count user-engagement)) u1),
+        first-viewed: (default-to stacks-block-height (get first-viewed user-engagement)),
+        last-viewed: stacks-block-height,
+        engagement-score: (+ (default-to u0 (get engagement-score user-engagement)) engagement-rating)
+      }
+    )
+    
+    ;; Update daily analytics
+    (update-daily-analytics content-id current-day)
+    
+    ;; Update creator analytics
+    (update-creator-analytics (get creator content) content-id)
+    
+    ;; Update user behavior analytics
+    (update-user-behavior-analytics tx-sender content-id engagement-rating (get creator content))
+    
+    (ok true)
+  )
+)
+
+;; Update daily analytics aggregation
+(define-private (update-daily-analytics (content-id uint) (day uint))
+  (let
+    (
+      (daily-data (map-get? daily-analytics { content-id: content-id, day: day }))
+    )
+    (map-set daily-analytics
+      { content-id: content-id, day: day }
+      {
+        views: (+ (default-to u0 (get views daily-data)) u1),
+        unique-users: (+ (default-to u0 (get unique-users daily-data)) u1),
+        total-engagement: (+ (default-to u0 (get total-engagement daily-data)) u1)
+      }
+    )
+  )
+)
+
+;; Update creator performance metrics
+(define-private (update-creator-analytics (creator principal) (content-id uint))
+  (let
+    (
+      (creator-data (map-get? creator-analytics { creator: creator }))
+      (content-analytics-data (map-get? content-analytics { content-id: content-id }))
+      (current-top-score (default-to u0 (get engagement-score content-analytics-data)))
+      (existing-top-score (get-creator-top-content-score creator))
+    )
+    (map-set creator-analytics
+      { creator: creator }
+      {
+        total-content: (default-to u1 (get total-content creator-data)),
+        total-views: (+ (default-to u0 (get total-views creator-data)) u1),
+        avg-engagement: (calculate-avg-engagement creator),
+        top-content-id: (if (> current-top-score existing-top-score) content-id 
+                         (default-to content-id (get top-content-id creator-data))),
+        last-updated: stacks-block-height
+      }
+    )
+  )
+)
+
+;; Update user behavior analytics
+(define-private (update-user-behavior-analytics (user principal) (content-id uint) (engagement uint) (creator principal))
+  (let
+    (
+      (user-data (map-get? user-behavior-analytics { user: user }))
+      (content-data (map-get? contents { content-id: content-id }))
+    )
+    (map-set user-behavior-analytics
+      { user: user }
+      {
+        total-content-viewed: (+ (default-to u0 (get total-content-viewed user-data)) u1),
+        avg-engagement: (/ (+ (* (default-to u5 (get avg-engagement user-data)) 
+                                (default-to u0 (get total-content-viewed user-data))) engagement)
+                          (+ (default-to u0 (get total-content-viewed user-data)) u1)),
+        preferred-access-level: (default-to u1 (get access-level content-data)),
+        most-viewed-creator: creator,
+        last-activity: stacks-block-height
+      }
+    )
+  )
+)
+
+;; Calculate average engagement for creator
+(define-private (calculate-avg-engagement (creator principal))
+  (let
+    (
+      (creator-data (map-get? creator-analytics { creator: creator }))
+    )
+    (default-to u5 (get avg-engagement creator-data))
+  )
+)
+
+;; Get top content score for creator
+(define-private (get-creator-top-content-score (creator principal))
+  (let
+    (
+      (creator-data (map-get? creator-analytics { creator: creator }))
+      (top-content-id (default-to u0 (get top-content-id creator-data)))
+      (top-content-analytics (map-get? content-analytics { content-id: top-content-id }))
+    )
+    (default-to u0 (get engagement-score top-content-analytics))
+  )
+)
+
+;; Update popular content rankings
+(define-public (update-content-rankings)
+  (begin
+    ;; This is a simplified ranking update - in practice would need more sophisticated ranking logic
+    (ok true)
+  )
+)
+
+;; Get content analytics
+(define-read-only (get-content-analytics (content-id uint))
+  (ok (unwrap! (map-get? content-analytics { content-id: content-id }) err-analytics-not-found))
+)
+
+;; Get user engagement with specific content
+(define-read-only (get-user-engagement (user principal) (content-id uint))
+  (ok (unwrap! (map-get? user-content-engagement { user: user, content-id: content-id }) err-analytics-not-found))
+)
+
+;; Get daily analytics for content
+(define-read-only (get-daily-analytics (content-id uint) (day uint))
+  (ok (unwrap! (map-get? daily-analytics { content-id: content-id, day: day }) err-analytics-not-found))
+)
+
+;; Get creator performance metrics
+(define-read-only (get-creator-analytics (creator principal))
+  (ok (unwrap! (map-get? creator-analytics { creator: creator }) err-analytics-not-found))
+)
+
+;; Get user behavior analytics
+(define-read-only (get-user-behavior (user principal))
+  (ok (unwrap! (map-get? user-behavior-analytics { user: user }) err-analytics-not-found))
+)
+
+;; Get popular content by rank
+(define-read-only (get-popular-content (rank uint))
+  (ok (unwrap! (map-get? popular-content-rankings { rank: rank }) err-analytics-not-found))
+)
+
+;; Get content engagement score
+(define-read-only (get-content-engagement-score (content-id uint))
+  (let
+    (
+      (analytics (map-get? content-analytics { content-id: content-id }))
+    )
+    (ok (default-to u0 (get engagement-score analytics)))
+  )
+)
+
+;; Get trending content based on recent engagement
+(define-read-only (check-content-trending (content-id uint))
+  (let
+    (
+      (analytics (map-get? content-analytics { content-id: content-id }))
+      (recent-threshold (- stacks-block-height u1008)) ;; Last week approximation
+    )
+    (ok (and 
+          (is-some analytics)
+          (> (default-to u0 (get last-viewed analytics)) recent-threshold)
+          (> (default-to u0 (get engagement-score analytics)) u50)))
+  )
+)
+
+;; Reset analytics for content (creator only)
+(define-public (reset-content-analytics (content-id uint))
+  (let
+    (
+      (content (unwrap! (map-get? contents { content-id: content-id }) err-content-not-found))
+    )
+    (asserts! (is-eq (get creator content) tx-sender) err-unauthorized)
+    
+    (map-set content-analytics
+      { content-id: content-id }
+      {
+        total-views: u0,
+        unique-viewers: u0,
+        engagement-score: u0,
+        last-viewed: u0,
+        creator: (get creator content)
+      }
+    )
+    (ok true)
+  )
+)
